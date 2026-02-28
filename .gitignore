@@ -1,0 +1,22 @@
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 個人資料（待辦 / 設定 / 備份）
+data/
+
+# EXE（用 GitHub Releases 發布）
+*.exe
+
+# 環境診斷腳本（非必要）
+check_env.bat
+
+# IDE
+.vscode/
+.idea/

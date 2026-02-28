@@ -1,0 +1,6 @@
+# TodoReminder 依賴套件
+# 安裝指令：pip install -r requirements.txt
+
+pystray>=0.19.5      # 系統列圖示
+Pillow>=10.0.0       # 圖示繪製（pystray 依賴）
+pyinstaller>=6.0.0   # 打包成 EXE
