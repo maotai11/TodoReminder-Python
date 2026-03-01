@@ -77,14 +77,8 @@ MIN_H     = 140
 MAX_H     = 600
 SORTBAR_H = 26
 
-SECTIONS = [
-    ('overdue',  '!! 逾期',    C_OVERDUE),
-    ('today',    '  今天',     C_TODAY),
-    ('tomorrow', '  明天',     C_TMRW),
-    ('future',   '  未來',     C_FUTURE),
-    ('nodate',   '  無截止日',  C_NODATE),
-    ('done',     '  已完成',   C_DONE_S),
-]
+# 區段鍵值（用於折疊狀態）
+SEC_KEYS = ('overdue', 'today', 'tomorrow', 'dayafter', 'future', 'nodate', 'done')
 
 WEEKDAY_NAMES = ('一', '二', '三', '四', '五', '六', '日')
 
@@ -120,12 +114,13 @@ def _acquire_mutex() -> bool:
 
 class Settings:
     DEFAULTS = {
-        'backup_time':      '23:00',
-        'backup_keep_days': 30,
-        'always_on_top':    True,
-        'widget_x':         60,
-        'widget_y':         100,
-        'widget_alpha':     0.88,
+        'backup_time':        '23:00',
+        'backup_keep_days':   30,
+        'always_on_top':      True,
+        'widget_x':           60,
+        'widget_y':           100,
+        'widget_alpha':       0.88,
+        'collapsed_sections': ['done'],   # 預設收起已完成
     }
 
     def __init__(self):
@@ -476,6 +471,109 @@ class TimePicker(tk.Toplevel):
 # 重複規則選單
 # ============================================================
 
+# ============================================================
+# 重複規則工具函式
+# ============================================================
+
+def _parse_recurrence(rec_str: str) -> dict:
+    """將重複規則字串解析為 dict。
+    格式: "daily:count=3" / "weekly:0,2:until=2025-03-01" / "monthly:15:count=3"
+    回傳: {interval, days, dom, until, count}
+    """
+    if not rec_str:
+        return {}
+    parts = rec_str.split(':')
+    r: dict = {'interval': parts[0], 'days': [], 'dom': None, 'until': None, 'count': None}
+    for p in parts[1:]:
+        if p.startswith('until='):
+            r['until'] = p[6:]
+        elif p.startswith('count='):
+            try:
+                r['count'] = int(p[6:])
+            except ValueError:
+                pass
+        elif r['interval'] == 'weekly':
+            try:
+                r['days'] = [int(d) for d in p.split(',') if d.strip().isdigit()]
+            except ValueError:
+                pass
+        elif r['interval'] == 'monthly':
+            try:
+                r['dom'] = int(p)
+            except ValueError:
+                pass
+    return r
+
+
+def _generate_occurrence_dates(due_date_str: str, rec_str: str) -> list:
+    """依重複規則從 due_date_str 起產生所有日期（含第一天）。
+    無結束條件（舊格式）→ 只回傳 [base]，不預產。
+    """
+    try:
+        base = date.fromisoformat(due_date_str)
+    except (ValueError, TypeError):
+        return []
+    r = _parse_recurrence(rec_str)
+    if not r:
+        return [base]
+
+    interval = r['interval']
+    until    = date.fromisoformat(r['until']) if r['until'] else None
+    count    = r['count']
+    MAX_OCC  = 365
+
+    if not count and not until:
+        # 無結束條件 = 視為單次，不預產
+        return [base]
+
+    dates: list = []
+
+    if interval == 'daily':
+        cur = base
+        while True:
+            dates.append(cur)
+            if count and len(dates) >= count:
+                break
+            cur += timedelta(days=1)
+            if until and cur > until:
+                break
+            if len(dates) >= MAX_OCC:
+                break
+
+    elif interval == 'weekly':
+        days = r['days'] or [base.weekday()]
+        dates = [base]
+        cur = base + timedelta(days=1)
+        end = until or (base + timedelta(days=365 * 2))
+        while cur <= end and len(dates) < MAX_OCC:
+            if cur.weekday() in days:
+                dates.append(cur)
+                if count and len(dates) >= count:
+                    break
+            cur += timedelta(days=1)
+
+    elif interval == 'monthly':
+        dom = r['dom'] or base.day
+        dates = [base]
+        y, m = base.year, base.month
+        for _ in range(MAX_OCC):
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+            try:
+                d = date(y, m, dom)
+            except ValueError:
+                import calendar as _cal
+                d = date(y, m, _cal.monthrange(y, m)[1])
+            if until and d > until:
+                break
+            dates.append(d)
+            if count and len(dates) >= count:
+                break
+
+    return dates
+
+
 class RecurrencePicker(tk.Toplevel):
     """
     重複規則選單（每天 / 每週 / 每月）。
@@ -494,23 +592,36 @@ class RecurrencePicker(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-        self._mode = tk.StringVar(value='daily')
-        self._weekdays = [tk.BooleanVar() for _ in range(7)]
+        self._mode        = tk.StringVar(value='daily')
+        self._weekdays    = [tk.BooleanVar() for _ in range(7)]
         self._monthly_day = tk.StringVar(value='1')
+        self._end_mode    = tk.StringVar(value='count')
+        self._count_var   = tk.StringVar(value='2')
+        self._until_date: str | None = None
+        self._until_lbl_var = tk.StringVar(value='選擇日期')
 
         if initial:
-            if initial.startswith('weekly:'):
+            r = _parse_recurrence(initial)
+            iv = r.get('interval', 'daily')
+            if iv == 'weekly':
                 self._mode.set('weekly')
-                for d in initial[7:].split(','):
-                    try:
-                        self._weekdays[int(d)].set(True)
-                    except Exception:
-                        pass
-            elif initial.startswith('monthly:'):
+                for d in (r.get('days') or []):
+                    if 0 <= d < 7:
+                        self._weekdays[d].set(True)
+            elif iv == 'monthly':
                 self._mode.set('monthly')
-                self._monthly_day.set(initial[8:])
+                if r.get('dom'):
+                    self._monthly_day.set(str(r['dom']))
             else:
                 self._mode.set('daily')
+
+            if r.get('until'):
+                self._end_mode.set('until')
+                self._until_date = r['until']
+                self._until_lbl_var.set(r['until'])
+            elif r.get('count'):
+                self._end_mode.set('count')
+                self._count_var.set(str(r['count']))
 
         self._build()
         self._center(parent)
@@ -565,6 +676,32 @@ class RecurrencePicker(tk.Toplevel):
         tk.Label(mf, text='天', bg=C_BG, fg=C_FG,
                  font=F_MAIN).pack(side='left')
 
+        # ---- 結束條件 ----
+        tk.Frame(body, bg='#333355', height=1).pack(fill='x', pady=(14, 6))
+        tk.Label(body, text='結束條件', bg=C_BG, fg='#888888',
+                 font=F_SMALL).pack(anchor='w')
+
+        until_row = tk.Frame(body, bg=C_BG)
+        until_row.pack(anchor='w', pady=2)
+        tk.Radiobutton(until_row, text='直到某日', variable=self._end_mode,
+                       value='until', **rb_kw).pack(side='left')
+        self._until_btn = tk.Label(until_row, textvariable=self._until_lbl_var,
+                                   bg='#333355', fg='#CCCCCC', font=F_SMALL,
+                                   cursor='hand2', padx=8, pady=2)
+        self._until_btn.pack(side='left', padx=6)
+        self._until_btn.bind('<Button-1>', lambda _e: self._pick_until())
+
+        count_row = tk.Frame(body, bg=C_BG)
+        count_row.pack(anchor='w', pady=2)
+        tk.Radiobutton(count_row, text='共', variable=self._end_mode,
+                       value='count', **rb_kw).pack(side='left')
+        tk.Spinbox(count_row, from_=1, to=99, textvariable=self._count_var,
+                   width=4, bg='#252545', fg=C_FG,
+                   buttonbackground='#333355',
+                   font=F_MAIN, relief='flat').pack(side='left', padx=4)
+        tk.Label(count_row, text='次', bg=C_BG, fg=C_FG,
+                 font=F_MAIN).pack(side='left')
+
         bf = tk.Frame(self, bg=C_FOOTER)
         bf.pack(fill='x')
 
@@ -578,19 +715,39 @@ class RecurrencePicker(tk.Toplevel):
         cancel_btn.pack(side='right', padx=8, pady=6)
         cancel_btn.bind('<Button-1>', lambda _e: self.destroy())
 
+    def _pick_until(self):
+        self._end_mode.set('until')
+        dp = DatePicker(self, initial=self._until_date)
+        self.wait_window(dp)
+        if dp.result:
+            self._until_date = dp.result
+            self._until_lbl_var.set(dp.result)
+
     def _ok(self):
         mode = self._mode.get()
         if mode == 'daily':
-            self.result = 'daily'
+            base = 'daily'
         elif mode == 'weekly':
             sel = [str(i) for i, v in enumerate(self._weekdays) if v.get()]
-            self.result = f'weekly:{",".join(sel)}' if sel else 'daily'
+            base = f'weekly:{",".join(sel)}' if sel else 'daily'
         elif mode == 'monthly':
             try:
                 day = int(self._monthly_day.get())
-                self.result = f'monthly:{day}' if 1 <= day <= 31 else 'daily'
+                base = f'monthly:{day}' if 1 <= day <= 31 else 'daily'
             except ValueError:
-                self.result = 'daily'
+                base = 'daily'
+        else:
+            base = 'daily'
+
+        end = self._end_mode.get()
+        if end == 'until' and self._until_date:
+            self.result = f'{base}:until={self._until_date}'
+        else:
+            try:
+                n = max(1, int(self._count_var.get()))
+            except ValueError:
+                n = 1
+            self.result = f'{base}:count={n}'
         self.destroy()
 
 # ============================================================
@@ -598,17 +755,25 @@ class RecurrencePicker(tk.Toplevel):
 # ============================================================
 
 def _fmt_recurrence(rec: str | None) -> str:
-    if not rec or rec == 'daily':
-        return '每天'
-    if rec.startswith('weekly:'):
-        try:
-            days = [WEEKDAY_NAMES[int(d)] for d in rec[7:].split(',')]
-            return '每週' + '、'.join(days)
-        except Exception:
-            return rec
-    if rec.startswith('monthly:'):
-        return f'每月 {rec[8:]} 日'
-    return rec
+    if not rec:
+        return ''
+    r = _parse_recurrence(rec)
+    iv = r.get('interval', 'daily')
+    if iv == 'daily':
+        s = '每天'
+    elif iv == 'weekly':
+        days = r.get('days') or []
+        s = '每週' + '、'.join(WEEKDAY_NAMES[d] for d in days if d < 7) if days else '每週'
+    elif iv == 'monthly':
+        dom = r.get('dom')
+        s = f'每月{dom}日' if dom else '每月'
+    else:
+        s = rec
+    if r.get('until'):
+        s += f'（到{r["until"][5:]}）'   # 顯示 MM-DD
+    elif r.get('count') and r['count'] > 1:
+        s += f'（共{r["count"]}次）'
+    return s
 
 # ============================================================
 # 資料模型
@@ -667,6 +832,7 @@ class Todo:
         if dd < today:   return 'overdue'
         if dd == today:  return 'today'
         if dd == today + timedelta(days=1): return 'tomorrow'
+        if dd == today + timedelta(days=2): return 'dayafter'
         return 'future'
 
     def should_remind(self, now: datetime) -> bool:
@@ -680,6 +846,13 @@ class Todo:
                 pass
         if now.strftime('%H:%M') != self.reminder:
             return False
+        # 有截止日 → 只在當天提醒
+        if self.due_date:
+            try:
+                return date.fromisoformat(self.due_date) == now.date()
+            except ValueError:
+                pass
+        # 無截止日 → 舊版重複規則邏輯（向下相容）
         rec = self.recurrence or 'daily'
         if rec == 'daily':
             return True
@@ -737,12 +910,24 @@ class TodoStore:
 
     def add(self, title: str, reminder=None, due_date=None,
             notes=None, category=None, recurrence=None, parent_id=None) -> Todo:
-        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
         with self._lock:
+            # 建立第一個實例（recurrence=None，實例不再重複觸發預產）
             t = Todo(self._next, title, False, reminder, due_date,
-                     now, None, notes, category, recurrence, parent_id)
+                     now_str, None, notes, category, None, parent_id)
             self._next += 1
             self._todos.append(t)
+
+            # 預產後續重複實例（僅限頂層任務且有截止日與重複規則）
+            if recurrence and due_date and parent_id is None:
+                dates = _generate_occurrence_dates(due_date, recurrence)
+                for d in dates[1:]:   # 跳過第一天（已建立）
+                    inst = Todo(self._next, title, False, reminder,
+                                d.isoformat(), now_str, None,
+                                notes, category, None, None)
+                    self._next += 1
+                    self._todos.append(inst)
+
             self._save()
         return t
 
@@ -875,6 +1060,142 @@ class ReminderChecker(threading.Thread):
             time.sleep(1)
 
 # ============================================================
+# 鬧鐘彈窗（獨立 Toplevel，不自動消失）
+# ============================================================
+
+class AlertWindow:
+    """提醒時間到時彈出的鬧鐘視窗，必須由使用者手動選擇完成或貪睡才關閉。"""
+
+    _W, _H = 400, 200   # 視窗尺寸
+
+    def __init__(self, root: tk.Tk, todo: Todo, store: TodoStore,
+                 on_close, on_status_msg):
+        """
+        root          : FloatingWidget 的 tk.Tk 根視窗
+        on_close      : 關閉後的回呼（用於顯示下一個排隊提醒）
+        on_status_msg : flash_status(msg, color) 回呼
+        """
+        self.todo         = todo
+        self.store        = store
+        self.on_close     = on_close
+        self.on_status    = on_status_msg
+
+        self._flash_id    = None
+        self._flash_state = False
+        self._flash_count = 0
+
+        self.win = tk.Toplevel(root)
+        self.win.title('待辦提醒')
+        self.win.attributes('-topmost', True)
+        self.win.resizable(False, False)
+        # 關閉視窗 (X) = 貪睡 5 分鐘
+        self.win.protocol('WM_DELETE_WINDOW', lambda: self._snooze(5))
+
+        self._build()
+        self._do_flash()
+
+        try:
+            import winsound
+            winsound.PlaySound('SystemExclamation',
+                               winsound.SND_ALIAS | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
+    def _build(self):
+        win = self.win
+        win.configure(bg='#881100')
+
+        # 置中螢幕
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x  = (sw - self._W) // 2
+        y  = (sh - self._H) // 2
+        win.geometry(f'{self._W}x{self._H}+{x}+{y}')
+
+        tk.Label(win, text=' !! 提醒時間到 !!', bg='#881100', fg='white',
+                 font=('Microsoft YaHei', 13, 'bold'), anchor='w'
+                 ).pack(fill='x', padx=10, pady=(14, 4))
+
+        short = (self.todo.title[:32] + '...') if len(self.todo.title) > 32 \
+                else self.todo.title
+        rec   = self.todo.recurrence or ''
+        extra = f'（{_fmt_recurrence(rec)}）' if rec else ''
+        self._lbl = tk.Label(win, text=f'  {short}{extra}',
+                             bg='#881100', fg='#FFDDDD',
+                             font=('Microsoft YaHei', 11),
+                             anchor='w', wraplength=360)
+        self._lbl.pack(fill='x', padx=10, pady=2)
+
+        # 截止日 / 提醒時間資訊
+        info = []
+        if self.todo.due_date:
+            info.append(f'截止：{self.todo.due_date}')
+        if self.todo.reminder:
+            info.append(f'提醒：{self.todo.reminder}')
+        if info:
+            self._info_lbl = tk.Label(win, text='  ' + '　'.join(info),
+                                      bg='#881100', fg='#FFAAAA',
+                                      font=('Microsoft YaHei', 9), anchor='w')
+            self._info_lbl.pack(fill='x', padx=10, pady=(0, 6))
+        else:
+            self._info_lbl = None
+
+        # 按鈕列
+        btn_row = tk.Frame(win, bg='#881100')
+        btn_row.pack(fill='x', padx=10, pady=(4, 14))
+
+        done_btn = tk.Button(btn_row, text='  已完成  ',
+                             bg='#228B22', fg='white',
+                             font=('Microsoft YaHei', 10, 'bold'),
+                             relief='flat', cursor='hand2',
+                             command=self._done)
+        done_btn.pack(side='left', padx=(0, 12))
+
+        tk.Label(btn_row, text='延遲：', bg='#881100', fg='#FFDDDD',
+                 font=('Microsoft YaHei', 9)).pack(side='left')
+
+        for mins, label in ((5, '+5分'), (15, '+15分'), (30, '+30分')):
+            b = tk.Button(btn_row, text=label, bg='#553300', fg='white',
+                          font=('Microsoft YaHei', 9),
+                          relief='flat', cursor='hand2',
+                          command=lambda m=mins: self._snooze(m))
+            b.pack(side='left', padx=3)
+
+    def _do_flash(self):
+        """閃爍 20 次後停止，但視窗保持開啟。"""
+        if self._flash_count < 20:
+            self._flash_state = not self._flash_state
+            c = '#CC2200' if self._flash_state else '#881100'
+            self.win.configure(bg=c)
+            self._lbl.configure(bg=c)
+            if self._info_lbl:
+                self._info_lbl.configure(bg=c)
+            self._flash_count += 1
+            self._flash_id = self.win.after(500, self._do_flash)
+
+    def _done(self):
+        self.store.toggle(self.todo.id)   # 標記已完成
+        self._close()
+
+    def _snooze(self, minutes: int):
+        until = (datetime.now() + timedelta(minutes=minutes)
+                 ).strftime('%Y-%m-%d %H:%M')
+        self.store.update(self.todo.id, snooze_until=until)
+        self.on_status(f'  已貪睡 {minutes} 分鐘', '#FFAA44')
+        self._close()
+
+    def _close(self):
+        if self._flash_id:
+            try:
+                self.win.after_cancel(self._flash_id)
+            except Exception:
+                pass
+        self.win.destroy()
+        self.on_close()
+
+
+# ============================================================
 # 浮動提醒板
 # ============================================================
 
@@ -884,13 +1205,12 @@ class FloatingWidget:
         self.settings    = settings
         self.on_open_mgr = on_open_mgr
 
-        self._alert_queue:  list[Todo] = []
-        self._alert_active  = False
-        self._flash_id      = None
-        self._flash_state   = False
-        self._flash_count   = 0
+        self._alert_queue:   list[Todo] = []
+        self._alert_showing: bool      = False
         self._drag_x = self._drag_y = 0
-        self._cur_todo: Todo | None = None
+        # 折疊區段（從設定載入，預設收起已完成）
+        self._collapsed: set[str] = set(
+            settings.get('collapsed_sections') or ['done'])
 
         # 子任務展開狀態（parent todo_id set）
         self._expanded: set[int] = set()
@@ -942,33 +1262,6 @@ class FloatingWidget:
             w.bind('<Button-1>',   self._drag_start)
             w.bind('<B1-Motion>',  self._drag_move)
             w.bind('<MouseWheel>', self._on_scroll)
-
-        # 警示覆蓋層（place，平時隱藏）
-        af = tk.Frame(r, bg=C_ALERT, height=72, width=WIN_W)
-        self._alert_frame = af
-
-        self._alert_lbl = tk.Label(
-            af, text='', bg=C_ALERT, fg='white',
-            font=('Microsoft YaHei', 10, 'bold'),
-            anchor='w', wraplength=200)
-        self._alert_lbl.pack(side='left', padx=8, fill='x', expand=True)
-
-        btn_col = tk.Frame(af, bg=C_ALERT)
-        btn_col.pack(side='right', padx=4)
-
-        ok_btn = tk.Label(btn_col, text=' 確認 ', bg='#880000',
-                          fg='white', font=F_SMALL, cursor='hand2', pady=3)
-        ok_btn.pack(pady=(8, 2))
-        ok_btn.bind('<Button-1>', lambda _e: self._dismiss_alert())
-
-        snooze_row = tk.Frame(btn_col, bg=C_ALERT)
-        snooze_row.pack()
-        for mins, label in ((5, '+5分'), (15, '+15分'), (30, '+30分')):
-            sl = tk.Label(snooze_row, text=label,
-                          bg='#553300', fg='white',
-                          font=F_SMALL, cursor='hand2', padx=3, pady=2)
-            sl.pack(side='left', padx=1)
-            sl.bind('<Button-1>', lambda _e, m=mins: self._snooze(m))
 
         # 底部（先 pack side='bottom'，確保不被擠掉）
         tk.Frame(r, bg='#2A1820', height=1).pack(side='bottom', fill='x')
@@ -1044,11 +1337,24 @@ class FloatingWidget:
         total     = len(top_level)
         done_n    = sum(1 for t in top_level if t.done)
 
-        groups = {k: [] for k, _, _ in SECTIONS}
+        groups: dict[str, list] = {k: [] for k in SEC_KEYS}
+        # 母任務放入所屬區段
         for t in top_level:
             groups[t.category_key()].append(t)
+        # 子任務若截止日與母任務不同區段，額外放入自己的區段顯示
+        _parent_cache: dict[int, Todo | None] = {}
+        for t in todos:
+            if t.parent_id is None:
+                continue
+            if t.parent_id not in _parent_cache:
+                _parent_cache[t.parent_id] = self.store.get(t.parent_id)
+            parent = _parent_cache[t.parent_id]
+            child_cat  = t.category_key()
+            parent_cat = parent.category_key() if parent else None
+            if child_cat != parent_cat:
+                groups[child_cat].append(t)
 
-        # 依排序模式對各區段內的項目排序
+        # 依排序模式排序各區段
         if self._sort_mode == 'duedate':
             for items in groups.values():
                 items.sort(key=lambda t: (
@@ -1058,23 +1364,68 @@ class FloatingWidget:
         elif self._sort_mode == 'created':
             for items in groups.values():
                 items.sort(key=lambda t: t.start_time or '', reverse=True)
-        # 'category' 模式保持原始讀取順序
 
-        has_any = False
-        for cat_key, label, color in SECTIONS:
-            items = groups[cat_key]
-            if not items:
-                continue
-            has_any = True
+        # 動態建立區段列表
+        today = date.today()
+        wd    = WEEKDAY_NAMES
+
+        def _sec(key, label, color, collapsible=False):
+            return (key, label, color, groups[key], collapsible)
+
+        sections = []
+        if groups['overdue']:
+            sections.append(_sec('overdue', '!! 逾期', C_OVERDUE))
+        # 今天：永遠顯示
+        sections.append(_sec(
+            'today', f'今天（{wd[today.weekday()]}）', C_TODAY))
+        # 明天：有任務才顯示
+        if groups['tomorrow']:
+            sections.append(_sec(
+                'tomorrow',
+                f'明天（{wd[(today + timedelta(1)).weekday()]}）',
+                C_TMRW))
+        # 後天：有任務才顯示
+        if groups['dayafter']:
+            sections.append(_sec(
+                'dayafter',
+                f'後天（{wd[(today + timedelta(2)).weekday()]}）',
+                C_TMRW))
+        # 未來可折疊
+        if groups['future']:
+            sections.append(_sec('future', '未來', C_FUTURE, True))
+        if groups['nodate']:
+            sections.append(_sec('nodate', '無截止日', C_NODATE, True))
+        if groups['done']:
+            sections.append(_sec('done', '已完成', C_DONE_S, True))
+
+        has_any = total > 0
+
+        for cat_key, label, color, items, collapsible in sections:
+            collapsed = collapsible and (cat_key in self._collapsed)
+            count     = len(items)
+
             sh = tk.Frame(self._inner, bg=C_BG)
             sh.pack(fill='x')
-            tk.Label(sh, text=label, bg=C_BG, fg=color,
-                     font=F_SEC, anchor='w', padx=8
-                     ).pack(side='left', pady=(5, 2))
+
+            arrow = ' ▶' if collapsed else (' ▼' if collapsible else '')
+            hdr   = tk.Label(sh, text=f' {label}  ({count}){arrow}',
+                             bg=C_BG, fg=color, font=F_SEC, anchor='w',
+                             padx=8, cursor='hand2' if collapsible else '')
+            hdr.pack(side='left', pady=(5, 2))
+            if collapsible:
+                hdr.bind('<Button-1>', lambda _e, k=cat_key: self._toggle_section(k))
+                hdr.bind('<MouseWheel>', self._on_scroll)
+
             tk.Frame(sh, bg=color, height=1).pack(
                 side='left', fill='x', expand=True, padx=(0, 8), pady=(5, 2))
-            for t in items:
-                self._make_row(t, cat_key)
+
+            if not collapsed:
+                for t in items:
+                    if t.parent_id is not None:
+                        # 跨區段子任務：顯示父任務參考 + 完整資訊
+                        self._make_child_row_in_section(t)
+                    else:
+                        self._make_row(t, cat_key)
 
         if not has_any:
             tk.Label(self._inner,
@@ -1091,10 +1442,12 @@ class FloatingWidget:
         self.root.after(20, self._auto_resize)
 
     def _make_row(self, t: Todo, cat_key: str):
-        kids  = self.store.children(t.id)
-        k_tot = len(kids)
-        k_don = sum(1 for c in kids if c.done)
-        expanded = (k_tot > 0) and (t.id in self._expanded)
+        all_kids  = self.store.children(t.id)
+        k_tot     = len(all_kids)
+        k_don     = sum(1 for c in all_kids if c.done)
+        # 展開時只顯示「同區段」子任務（其他區段的子任務已在自己的區段顯示）
+        kids      = [c for c in all_kids if c.category_key() == cat_key]
+        expanded  = (k_tot > 0) and (t.id in self._expanded)
 
         rf = tk.Frame(self._inner, bg=C_BG)
         rf.pack(fill='x', padx=4, pady=1)
@@ -1168,14 +1521,26 @@ class FloatingWidget:
         rf.pack(fill='x', padx=4, pady=0)
 
         chk  = '[v]' if t.done else '[ ]'
-        ttxt = t.title if len(t.title) <= 22 else t.title[:20] + '..'
-        fg   = C_DONE if t.done else C_FG
+        ttxt = t.title if len(t.title) <= 20 else t.title[:18] + '..'
+        fg   = C_DONE if t.done else (C_REMIND if t.reminder else C_FG)
 
         lbl = tk.Label(rf, text=f'     {chk} {ttxt}',
                        bg=C_SUB, fg=fg, font=F_SMALL,
-                       anchor='w', padx=6, pady=3, cursor='hand2')
+                       anchor='w', padx=6, pady=2, cursor='hand2')
         lbl.pack(fill='x')
         lbl.bind('<Button-1>', lambda _e, tid=t.id: self._toggle(tid))
+
+        # 子資訊：截止日 + 提醒時間
+        if t.done:
+            sub = f'       完成：{t.done_at}' if t.done_at else ''
+        else:
+            parts = []
+            if t.reminder:  parts.append(f'@{t.reminder}')
+            if t.due_date:  parts.append(f'截止：{t.due_date}')
+            sub = '       ' + '  '.join(parts) if parts else ''
+        if sub:
+            tk.Label(rf, text=sub, bg=C_SUB, fg='#888888',
+                     font=F_SMALL, anchor='w', padx=6).pack(fill='x')
 
         def _enter(_e, l=lbl, f=rf):
             l.configure(bg=C_HOVER); f.configure(bg=C_HOVER)
@@ -1187,6 +1552,61 @@ class FloatingWidget:
         lbl.bind('<Leave>', _leave)
         rf.bind('<Enter>',  _enter)
         rf.bind('<Leave>',  _leave)
+
+    def _make_child_row_in_section(self, t: Todo):
+        """跨區段子任務：有自己的截止日且與母任務不同區段，獨立顯示在對應區段。"""
+        parent     = self.store.get(t.parent_id)
+        pt_short   = (parent.title[:14] + '..') if parent and len(parent.title) > 14 \
+                     else (parent.title if parent else '?')
+
+        rf = tk.Frame(self._inner, bg=C_SUB)
+        rf.pack(fill='x', padx=4, pady=1)
+
+        # 父任務參考標籤
+        tk.Label(rf, text=f'  ↳ {pt_short}',
+                 bg=C_SUB, fg='#666688', font=F_SMALL,
+                 anchor='w', padx=6).pack(fill='x')
+
+        chk  = '[v]' if t.done else '[ ]'
+        ttxt = t.title[:18] + '..' if len(t.title) > 18 else t.title
+        fg   = C_DONE if t.done else (C_REMIND if t.reminder else C_FG)
+
+        lbl = tk.Label(rf, text=f'    {chk} {ttxt}',
+                       bg=C_SUB, fg=fg, font=F_MAIN,
+                       anchor='w', padx=6, cursor='hand2')
+        lbl.pack(fill='x')
+        lbl.bind('<Button-1>', lambda _e, tid=t.id: self._toggle(tid))
+
+        # 子資訊：提醒 + 分類
+        if t.done:
+            sub = f'      完成：{t.done_at}' if t.done_at else ''
+        else:
+            parts = []
+            if t.reminder:  parts.append(f'@{t.reminder}')
+            if t.category:  parts.append(f'[{t.category}]')
+            sub = '      ' + '  '.join(parts) if parts else ''
+        if sub:
+            tk.Label(rf, text=sub, bg=C_SUB, fg='#888888',
+                     font=F_SMALL, anchor='w', padx=6).pack(fill='x')
+
+        def _enter(_e, l=lbl, f=rf):
+            l.configure(bg=C_HOVER); f.configure(bg=C_HOVER)
+        def _leave(_e, l=lbl, f=rf):
+            l.configure(bg=C_SUB); f.configure(bg=C_SUB)
+
+        lbl.bind('<Enter>', _enter)
+        lbl.bind('<Leave>', _leave)
+        rf.bind('<Enter>',  _enter)
+        rf.bind('<Leave>',  _leave)
+
+    def _toggle_section(self, key: str):
+        """點擊區段標題折疊 / 展開。"""
+        if key in self._collapsed:
+            self._collapsed.discard(key)
+        else:
+            self._collapsed.add(key)
+        self.settings.set('collapsed_sections', list(self._collapsed))
+        self._do_refresh()
 
     def _toggle_expand(self, todo_id: int):
         """切換子任務展開 / 收納。"""
@@ -1218,69 +1638,34 @@ class FloatingWidget:
         self.store.toggle(todo_id)
         self._do_refresh()
 
-    # ---- 提醒 / 貪睡 ----
+    # ---- 提醒 / 鬧鐘彈窗 ----
 
     def trigger_alert(self, todo: Todo):
         self.root.after(0, lambda: self._enqueue(todo))
 
     def _enqueue(self, todo: Todo):
         self._alert_queue.append(todo)
-        if not self._alert_active:
+        if not self._alert_showing:
             self._show_next()
 
     def _show_next(self):
         if not self._alert_queue:
+            self._alert_showing = False
             return
+        self._alert_showing = True
         todo = self._alert_queue.pop(0)
-        self._cur_todo       = todo
-        self._alert_active   = True
-        self._flash_count    = 0
-        self._flash_state    = False
+        AlertWindow(
+            root          = self.root,
+            todo          = todo,
+            store         = self.store,
+            on_close      = self._on_alert_closed,
+            on_status_msg = self.flash_status,
+        )
 
-        short = todo.title[:24] + '...' if len(todo.title) > 24 else todo.title
-        rec   = todo.recurrence or ''
-        extra = f'  ({_fmt_recurrence(rec)})' if rec and rec != 'daily' else ''
-        self._alert_lbl.configure(text=f'  提醒：{short}{extra}')
-        self._alert_frame.place(x=0, y=HEADER_H + 1, width=WIN_W, height=72)
-        self._alert_frame.lift()
-        self._do_flash()
-        try:
-            import winsound
-            winsound.PlaySound('SystemExclamation',
-                               winsound.SND_ALIAS | winsound.SND_ASYNC)
-        except Exception:
-            pass
-
-    def _do_flash(self):
-        if not self._alert_active:
-            return
-        if self._flash_count >= 120:
-            self._dismiss_alert()
-            return
-        self._flash_state = not self._flash_state
-        c = '#CC2200' if self._flash_state else '#881100'
-        self._alert_frame.configure(bg=c)
-        self._alert_lbl.configure(bg=c)
-        self._flash_count += 1
-        self._flash_id = self.root.after(500, self._do_flash)
-
-    def _dismiss_alert(self):
-        self._alert_active = False
-        self._cur_todo     = None
-        if self._flash_id:
-            self.root.after_cancel(self._flash_id)
-            self._flash_id = None
-        self._alert_frame.place_forget()
-        if self._alert_queue:
-            self.root.after(400, self._show_next)
-
-    def _snooze(self, minutes: int):
-        if self._cur_todo:
-            until = (datetime.now() + timedelta(minutes=minutes)
-                     ).strftime('%Y-%m-%d %H:%M')
-            self.store.update(self._cur_todo.id, snooze_until=until)
-        self._dismiss_alert()
-        self.flash_status(f'  已貪睡 {minutes} 分鐘', '#FFAA44')
+    def _on_alert_closed(self):
+        """AlertWindow 關閉後觸發：重新整理面板，並顯示下一個排隊提醒。"""
+        self._do_refresh()
+        self.root.after(300, self._show_next)
 
     def flash_status(self, msg: str, color: str = '#FF6060'):
         def _show():
@@ -1606,21 +1991,20 @@ class ManagerWindow:
 
         category = None
         notes    = None
-        if parent_id is None:
-            cats    = self.store.categories()
-            hint    = '  '.join(cats) if cats else '例：工作、個人'
-            cat_raw = simpledialog.askstring(
-                '分類標籤（選填）',
-                f'現有分類：{hint}\n（取消跳過）',
-                parent=self.win)
-            if cat_raw and cat_raw.strip():
-                category = cat_raw.strip()
+        cats     = self.store.categories()
+        hint     = '  '.join(cats) if cats else '例：工作、個人'
+        cat_raw  = simpledialog.askstring(
+            '分類標籤（選填）',
+            f'現有分類：{hint}\n（取消跳過）',
+            parent=self.win)
+        if cat_raw and cat_raw.strip():
+            category = cat_raw.strip()
 
-            n_raw = simpledialog.askstring(
-                '備註（選填）', '額外說明文字：（取消跳過）',
-                parent=self.win)
-            if n_raw and n_raw.strip():
-                notes = n_raw.strip()
+        n_raw = simpledialog.askstring(
+            '備註（選填）', '額外說明文字：（取消跳過）',
+            parent=self.win)
+        if n_raw and n_raw.strip():
+            notes = n_raw.strip()
 
         self.store.add(title, reminder, due_date, notes, category,
                        recurrence, parent_id)

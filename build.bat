@@ -38,9 +38,9 @@ echo [1/3] Python found:
 %PYTHON_CMD% --version
 echo.
 
-:: -- Install dependencies -----------------------------------------
-echo [2/3] Installing dependencies...
-%PYTHON_CMD% -m pip install pystray Pillow pyinstaller --quiet --upgrade
+:: -- Install dependencies (skip if already installed) -------------
+echo [2/3] Checking dependencies...
+%PYTHON_CMD% -m pip install pystray Pillow pyinstaller --quiet
 if errorlevel 1 (
     echo [ERROR] pip install failed. Check internet connection.
     pause
