@@ -1762,7 +1762,7 @@ class ManagerWindow:
         self._rebuild_cat_bar()
 
         # 欄位說明
-        tk.Label(w, text='  任務（點擊切換完成）                          [刪]',
+        tk.Label(w, text='  任務（點 [ ] 切換完成，雙擊標題或按 [編] 編輯）                 [編][刪]',
                  bg=C_BG, fg='#555555', font=F_SMALL, anchor='w'
                  ).pack(fill='x', padx=4)
         tk.Frame(w, bg='#333355', height=1).pack(fill='x', padx=4)
@@ -1894,11 +1894,22 @@ class ManagerWindow:
         elif t.reminder:    col = C_REMIND
         else:               col = C_FG
 
-        task = tk.Label(top, text=f'{chk} {ttxt}{prog}',
+        done_lbl = tk.Label(top, text=chk,
+                            bg=bg_row, fg=col, font=F_MAIN,
+                            anchor='w', cursor='hand2', padx=pad_l, pady=1)
+        done_lbl.pack(side='left')
+        done_lbl.bind('<Button-1>', lambda _e, tid=t.id: self._toggle(tid))
+
+        task = tk.Label(top, text=f' {ttxt}{prog}',
                         bg=bg_row, fg=col, font=F_MAIN,
                         anchor='w', cursor='hand2', padx=pad_l, pady=1)
         task.pack(side='left', fill='x', expand=True)
-        task.bind('<Button-1>', lambda _e, tid=t.id: self._toggle(tid))
+        task.bind('<Double-Button-1>', lambda _e, tid=t.id: self._edit_task(tid))
+
+        edit_lbl = tk.Label(top, text='[編]', bg=bg_row, fg='#6FA8DC',
+                            font=F_SMALL, cursor='hand2', padx=4)
+        edit_lbl.pack(side='right')
+        edit_lbl.bind('<Button-1>', lambda _e, tid=t.id: self._edit_task(tid))
 
         del_lbl = tk.Label(top, text='[刪]', bg=bg_row, fg='#FF6666',
                            font=F_SMALL, cursor='hand2', padx=4)
@@ -1948,13 +1959,13 @@ class ManagerWindow:
 
         tk.Frame(rf, bg='#252535', height=1).pack(fill='x', pady=(2, 0))
 
-        def _enter(_e, ws=(rf, top, task)):
+        def _enter(_e, ws=(rf, top, done_lbl, task, edit_lbl, del_lbl)):
             for ww in ws: ww.configure(bg=C_HOVER)
 
-        def _leave(_e, ws=(rf, top, task), bg=bg_row):
+        def _leave(_e, ws=(rf, top, done_lbl, task, edit_lbl, del_lbl), bg=bg_row):
             for ww in ws: ww.configure(bg=bg)
 
-        for ww in (rf, top, task):
+        for ww in (rf, top, done_lbl, task, edit_lbl, del_lbl):
             ww.bind('<Enter>', _enter)
             ww.bind('<Leave>', _leave)
 
@@ -1978,36 +1989,126 @@ class ManagerWindow:
         self.win.wait_window(rp)
         return rp.result
 
+    def _open_task_editor(self, mode: str, todo: Todo | None = None, parent_id: int | None = None):
+        dlg = tk.Toplevel(self.win)
+        dlg.title('新增任務' if mode == 'add' else '編輯任務')
+        dlg.configure(bg=C_BG)
+        dlg.transient(self.win)
+        dlg.grab_set()
+        dlg.resizable(True, False)
+        dlg.minsize(620, 360)
+        dlg.geometry('700x430')
+
+        title_var = tk.StringVar(value=(todo.title if todo else ''))
+        due_var = tk.StringVar(value=(todo.due_date if todo and todo.due_date else ''))
+        rem_var = tk.StringVar(value=(todo.reminder if todo and todo.reminder else ''))
+        rec_var = tk.StringVar(value=(todo.recurrence if todo and todo.recurrence else ''))
+        cat_var = tk.StringVar(value=(todo.category if todo and todo.category else ''))
+
+        body = tk.Frame(dlg, bg=C_BG)
+        body.pack(fill='both', expand=True, padx=12, pady=12)
+        for c in (1, 3):
+            body.grid_columnconfigure(c, weight=1)
+
+        tk.Label(body, text='任務名稱', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=0, column=0, sticky='w', padx=4, pady=6)
+        tk.Entry(body, textvariable=title_var, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat').grid(
+            row=0, column=1, columnspan=3, sticky='ew', padx=4, pady=6
+        )
+
+        tk.Label(body, text='截止日期', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=1, column=0, sticky='w', padx=4, pady=6)
+        tk.Entry(body, textvariable=due_var, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat').grid(
+            row=1, column=1, sticky='ew', padx=4, pady=6
+        )
+        tk.Button(body, text='選日期', command=lambda: due_var.set(self._ask_date(due_var.get() or None) or due_var.get()),
+                  bg='#334466', fg='white', relief='flat').grid(row=1, column=2, sticky='w', padx=4, pady=6)
+        tk.Button(body, text='清空', command=lambda: due_var.set(''),
+                  bg='#444444', fg='white', relief='flat').grid(row=1, column=3, sticky='w', padx=4, pady=6)
+
+        tk.Label(body, text='提醒時間', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=2, column=0, sticky='w', padx=4, pady=6)
+        tk.Entry(body, textvariable=rem_var, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat').grid(
+            row=2, column=1, sticky='ew', padx=4, pady=6
+        )
+        tk.Button(body, text='選時間', command=lambda: rem_var.set(self._ask_time(rem_var.get() or None) or rem_var.get()),
+                  bg='#334466', fg='white', relief='flat').grid(row=2, column=2, sticky='w', padx=4, pady=6)
+        tk.Button(body, text='清空', command=lambda: rem_var.set(''),
+                  bg='#444444', fg='white', relief='flat').grid(row=2, column=3, sticky='w', padx=4, pady=6)
+
+        tk.Label(body, text='重複規則', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=3, column=0, sticky='w', padx=4, pady=6)
+        tk.Entry(body, textvariable=rec_var, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat').grid(
+            row=3, column=1, sticky='ew', padx=4, pady=6
+        )
+        tk.Button(
+            body, text='設定重複',
+            command=lambda: rec_var.set(self._ask_recurrence(rec_var.get() or 'daily') or rec_var.get()),
+            bg='#334466', fg='white', relief='flat'
+        ).grid(row=3, column=2, sticky='w', padx=4, pady=6)
+        tk.Button(body, text='清空', command=lambda: rec_var.set(''),
+                  bg='#444444', fg='white', relief='flat').grid(row=3, column=3, sticky='w', padx=4, pady=6)
+
+        tk.Label(body, text='分類', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=4, column=0, sticky='w', padx=4, pady=6)
+        tk.Entry(body, textvariable=cat_var, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat').grid(
+            row=4, column=1, columnspan=3, sticky='ew', padx=4, pady=6
+        )
+        cats = self.store.categories()
+        hint = '、'.join(cats[:10]) if cats else '（目前無分類）'
+        tk.Label(body, text=f'現有分類：{hint}', bg=C_BG, fg='#8899AA', font=F_SMALL, anchor='w').grid(
+            row=5, column=0, columnspan=4, sticky='ew', padx=4, pady=(0, 6)
+        )
+
+        tk.Label(body, text='備註', bg=C_BG, fg=C_FG, font=F_SMALL).grid(row=6, column=0, sticky='nw', padx=4, pady=6)
+        notes_text = tk.Text(body, height=6, bg='#252545', fg=C_FG, insertbackground=C_FG, relief='flat', wrap='word')
+        notes_text.grid(row=6, column=1, columnspan=3, sticky='nsew', padx=4, pady=6)
+        body.grid_rowconfigure(6, weight=1)
+        if todo and todo.notes:
+            notes_text.insert('1.0', todo.notes)
+
+        result = {'ok': False, 'data': None}
+
+        def _submit():
+            title = title_var.get().strip()
+            if not title:
+                messagebox.showwarning('輸入錯誤', '任務名稱不可空白', parent=dlg)
+                return
+            reminder = rem_var.get().strip() or None
+            due_date = due_var.get().strip() or None
+            recurrence = rec_var.get().strip() or None
+            if not reminder:
+                recurrence = None
+            notes = notes_text.get('1.0', 'end').strip() or None
+            category = cat_var.get().strip() or None
+            result['ok'] = True
+            result['data'] = {
+                'title': title,
+                'due_date': due_date,
+                'reminder': reminder,
+                'recurrence': recurrence,
+                'category': category,
+                'notes': notes,
+                'parent_id': parent_id,
+            }
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=C_BG)
+        btns.pack(fill='x', padx=12, pady=(0, 12))
+        tk.Button(btns, text='取消', command=dlg.destroy, bg='#444444', fg='white', relief='flat').pack(side='right', padx=4)
+        tk.Button(btns, text='儲存', command=_submit, bg='#16A085', fg='white', relief='flat').pack(side='right', padx=4)
+
+        dlg.wait_window()
+        return result['data'] if result['ok'] else None
+
     def _add(self, parent_id: int | None = None):
-        label = '子任務名稱：' if parent_id else '任務名稱：'
-        title = simpledialog.askstring('新增任務', label, parent=self.win)
-        if not title or not title.strip():
+        data = self._open_task_editor('add', parent_id=parent_id)
+        if not data:
             return
-        title = title.strip()
-
-        due_date  = self._ask_date()
-        reminder  = self._ask_time()
-        recurrence = self._ask_recurrence(initial='daily') if reminder else None
-
-        category = None
-        notes    = None
-        cats     = self.store.categories()
-        hint     = '  '.join(cats) if cats else '例：工作、個人'
-        cat_raw  = simpledialog.askstring(
-            '分類標籤（選填）',
-            f'現有分類：{hint}\n（取消跳過）',
-            parent=self.win)
-        if cat_raw and cat_raw.strip():
-            category = cat_raw.strip()
-
-        n_raw = simpledialog.askstring(
-            '備註（選填）', '額外說明文字：（取消跳過）',
-            parent=self.win)
-        if n_raw and n_raw.strip():
-            notes = n_raw.strip()
-
-        self.store.add(title, reminder, due_date, notes, category,
-                       recurrence, parent_id)
+        self.store.add(
+            data['title'],
+            data['reminder'],
+            data['due_date'],
+            data['notes'],
+            data['category'],
+            data['recurrence'],
+            data['parent_id'],
+        )
         self._refresh()
         self._widget_refresh()
 
@@ -2057,6 +2158,25 @@ class ManagerWindow:
         if new_n is None:
             return
         self.store.update(todo_id, notes=new_n.strip() or None)
+        self._refresh()
+        self._widget_refresh()
+
+    def _edit_task(self, todo_id: int):
+        t = self.store.get(todo_id)
+        if not t:
+            return
+        data = self._open_task_editor('edit', todo=t, parent_id=t.parent_id)
+        if not data:
+            return
+        self.store.update(
+            todo_id,
+            title=data['title'],
+            due_date=data['due_date'],
+            reminder=data['reminder'],
+            recurrence=data['recurrence'],
+            category=data['category'],
+            notes=data['notes'],
+        )
         self._refresh()
         self._widget_refresh()
 
